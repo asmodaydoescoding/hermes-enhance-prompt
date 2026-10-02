@@ -5,9 +5,9 @@
  * revert; click while spinning to cancel. A small score badge appears next
  * to the sparkle after a successful rewrite.
  *
- * Uses the current active model via host.request → session.create (the same
- * one the rest of the app uses), so the rewrite is "what the current model
- * would naturally produce, focused on prompt craft."
+ * Uses a direct, tool-free host completion through the plugin API. It uses the
+ * active Hermes model/auth but cannot create sessions, invoke skills, or call
+ * tools such as prompt-master. Scoring runs separately after the rewrite lands.
  *
  * Ctrl/Cmd+K runs the same action.
  */
@@ -28,87 +28,9 @@ import {
 
 /* ─── Tunables ──────────────────────────────────────────────────────────── */
 
-const MAX_LEN = 1000;           // soft target per stage
-// No hard output cap. If the model decides a brief needs 18K chars to
-// be complete, that's the right answer for that input. Truncation
-// loses information the model was instructed to include. The GMI
-// serving endpoint already enforces its own token limit, so the
-// request is bounded by the model's context window, not by us.
-// Real-world upper bound: GPT-5 leaked system prompt is ~27K chars;
-// user-input briefs in this plugin top out around 15–20K. We
-// surface the length in the toast so the user can see what was
-// produced, but never chop.
-const INIT_POLL_MS = 1200;    // first poll interval
-const MAX_POLL_MS = 3000;     // max poll interval (exponential backoff)
-const TIMEOUT_MS = 90_000;    // total session polling timeout
-const MIN_LEN = 8;            // minimum draft length to activate
-
-/* ─── Rewrite prompt (inline — must stay in sync with prompts.py) ───────── */
-
-const SYSTEM = `You are a prompt engineer. Rewrite user requests into clear, well-structured agent prompts.
-
-Your job is NOT to answer the request — it is to reformulate it so an AI agent can execute it correctly on the first attempt.
-
-## Format
-
-Write ONE goal line followed by numbered items (1. 2. 3.). Preserve the original language.
-
-**For short or already-clear inputs:** return the same intent in fewer words as 1-3 tight bullets. Do not pad.
-
-**For substantive inputs (multi-sentence, real task, no clear shape):** produce a production-grade brief:
-
-1. **Goal** — one line stating what success looks like
-2. **Role & context** — who the agent is, what tools it has, any runtime constraints
-3. **Scope** — what is in scope (IN:) and what is out of scope (OUT:)
-4. **Requirements** — 3-7 concrete numbered requirements, each one a single verifiable action
-5. **Deliverable** — what form the output takes: files, format, coverage
-6. **Quality gates** — what "done" means, how the agent should verify completion
-7. **Anti-patterns** — 2-4 things to NOT do
-
-Use only the sections that apply. Do not invent sections.
-
-## Rules
-
-- Match the original language (English/Malay/etc.)
-- Do NOT answer the request — restate it as an actionable task
-- Do NOT add goals the user did not mention
-- Do NOT write tutorial-style output ("First, do X, then Y...")
-- Prefer concrete nouns over vague ones ("table" not "the data structure")
-- Aim for 600–2400 characters. If the task needs more detail to be actionable, expand; if it's already tight, keep it short.`;
-
-const USER_WRAP = `Rewrite this request as an agent prompt:
-
-{input}
-
----`;
-
-/* ─── RPC helpers ─────────────────────────────────────────────────────────── */
-
-function unwrap(res) {
-  if (!res || typeof res !== "object") return {};
-  if (res.result && typeof res.result === "object") return res.result;
-  return res;
-}
-
-function rpcFail(res) {
-  if (!res || typeof res !== "object") return null;
-  if (res.ok === false) {
-    const err = res.error;
-    if (!err) return "request failed";
-    if (typeof err === "string") return err;
-    return err.message || String(err);
-  }
-  return null;
-}
-
-async function rpc(method, params) {
-  if (typeof host.request !== "function")
-    throw new Error("host.request unavailable");
-  const res = await host.request(method, params);
-  const fail = rpcFail(res);
-  if (fail) throw new Error(method + ": " + fail);
-  return unwrap(res);
-}
+const REQUEST_TIMEOUT_MS = 300_000; // model calls may legitimately take several minutes
+const REST_TIMEOUT_MS = REQUEST_TIMEOUT_MS + 10_000;
+const MIN_LEN = 8;
 
 /* ─── Composer DOM helpers ────────────────────────────────────────────────── */
 
@@ -173,117 +95,85 @@ function stripQuotes(text) {
     .trim();
 }
 
-function lastAssistant(messages) {
-  if (!Array.isArray(messages)) return "";
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (!m || m.role !== "assistant") continue;
-    if (typeof m.content === "string") return m.content;
-    if (Array.isArray(m.content)) {
-      const bits = m.content
-        .map((p) => {
-          if (typeof p === "string") return p;
-          if (p && typeof p.text === "string") return p.text;
-          if (p && typeof p.content === "string") return p.content;
-          return "";
-        })
-        .filter(Boolean);
-      if (bits.length) return bits.join("\n");
-    }
-    if (typeof m.text === "string") return m.text;
-  }
-  return "";
+function abortError() {
+  return new DOMException("aborted", "AbortError");
 }
 
-/* ─── G-EVAL scorer (LLM-as-judge) ─────────────────────────────────────────── */
-
-const SCORER_SYSTEM = `You are an expert evaluator of prompts for an AI coding assistant.
-
-Score the prompt on five criteria using a 1–5 scale (5 = excellent, 1 = poor).
-Use the full range. Be strict.
-
-Criteria:
-1. Clarity (1-5) — Is the language clear, grammatical, and unambiguous?
-2. Specificity (1-5) — Is the task scope well-defined, with concrete details?
-3. Actionability (1-5) — Can an AI take concrete steps from this prompt?
-4. Structure (1-5) — Is it organised (goal line, numbered steps, sections)?
-5. Concreteness (1-5) — Does it name real nouns (file, function, table, api)?
-
-Reply ONLY with valid JSON, no prose, no fences:
-{"clarity":N,"specificity":N,"actionability":N,"structure":N,"concreteness":N,"reason":"<one short sentence>"}
-
-N must be an integer 1..5. If the prompt is empty, return 1s.`;
-
-const SCORER_USER = (label, text) =>
-  `${label}\n\nPROMPT TO EVALUATE:\n"""\n${text.slice(0, 4000)}
-"""\n\nJSON:`;
-
-async function geValScore(ctx, label, text) {
-  if (!text || !text.trim()) {
-    return { total: 0, parts: { clarity: 0, specificity: 0, actionability: 0, structure: 0, concreteness: 0 }, reason: "empty" };
-  }
-  const created = await rpc("session.create", {
-    title: "Score prompt",
-    hidden: true,
-    messages: [{ role: "system", content: SCORER_SYSTEM }],
-  });
-  const sid = created.session_id;
-  if (!sid) throw new Error("scorer: session.create returned no session_id");
-  await rpc("prompt.submit", { session_id: sid, text: SCORER_USER(label, text) });
-
-  const start = Date.now();
-  let last = "";
-  let stable = 0;
-  while (Date.now() - start < 30_000) {
-    try {
-      const hist = await rpc("session.history", { session_id: sid });
-      const raw = stripQuotes(lastAssistant(hist.messages || hist.history || []));
-      if (raw && raw === last) {
-        stable += 1;
-        if (stable >= 2) {
-          const parsed = parseScore(raw);
-          if (parsed) return scaleTo100(parsed, raw);
-        }
-      } else if (raw) {
-        last = raw;
-        stable = 0;
+function withAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      cleanup();
+      reject(abortError());
+    };
+    const cleanup = () => signal.removeEventListener("abort", onAbort);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error) => {
+        cleanup();
+        reject(error);
       }
-    } catch {
-      /* keep polling */
-    }
-    await new Promise((r) => setTimeout(r, 600));
-  }
-  return null;
+    );
+  });
 }
 
-function parseScore(raw) {
-  // Find a JSON object in the response; tolerate leading prose.
-  const m = raw.match(/\{[^{}]*"clarity"[^{}]*\}/i);
-  const text = m ? m[0] : raw;
-  try {
-    const j = JSON.parse(text);
-    const n = (v) => {
-      const x = Math.round(Number(v));
-      if (!Number.isFinite(x)) return 0;
-      return Math.max(0, Math.min(5, x));
-    };
+async function pluginApiRequest(request, path, body, signal) {
+  if (typeof request !== "function") {
+    throw new Error("Enhance Prompt backend unavailable; restart or update Hermes Desktop");
+  }
+  const result = await withAbort(
+    Promise.resolve().then(() =>
+      request(path, {
+        method: "POST",
+        body,
+        timeoutMs: REST_TIMEOUT_MS,
+      })
+    ),
+    signal
+  );
+  if (result && result.ok === false) {
+    const detail = result.detail || result.error || "request failed";
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+  }
+  return result || {};
+}
+
+async function geValScore(request, label, text, signal) {
+  if (!text || !text.trim()) {
     return {
-      clarity: n(j.clarity),
-      specificity: n(j.specificity),
-      actionability: n(j.actionability),
-      structure: n(j.structure),
-      concreteness: n(j.concreteness),
-      reason: typeof j.reason === "string" ? j.reason : "",
+      total: 0,
+      parts: {
+        clarity: 0,
+        specificity: 0,
+        actionability: 0,
+        structure: 0,
+        concreteness: 0,
+      },
+      reason: "empty",
     };
-  } catch {
-    return null;
   }
+  const result = await pluginApiRequest(
+    request,
+    "/score",
+    { label, text: text.slice(0, 4000) },
+    signal
+  );
+  return result.score || null;
 }
 
-function scaleTo100(parts, raw) {
-  // 5 criteria × 5 = 25. Scale to 0–100.
-  const sum = parts.clarity + parts.specificity + parts.actionability + parts.structure + parts.concreteness;
-  return { total: Math.round((sum / 25) * 100), parts, reason: parts.reason || "" };
+async function enhanceOnce(input, signal, maxChars, stage, request) {
+  const result = await pluginApiRequest(
+    request,
+    "/rewrite",
+    { input, max_chars: maxChars, stage },
+    signal
+  );
+  return stripQuotes(result.text || "");
 }
 
 function scoreClass(s) {
@@ -292,113 +182,9 @@ function scoreClass(s) {
   return "text-muted-foreground/70";
 }
 
-/* ─── Rewrite session ─────────────────────────────────────────────────────── */
-
-function sleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new DOMException("aborted", "AbortError"));
-      return;
-    }
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(t);
-        reject(new DOMException("aborted", "AbortError"));
-      },
-      { once: true }
-    );
-  });
-}
-
-/* ─── Stage system prompts ──────────────────────────────────────────────── */
-// Each stage is a distinct *transformation* of the input, not just a
-// longer version of the same thing. The base SYSTEM prompt is the
-// shared style guide; the stage hint tells the model what shape to
-// produce for this pass.
-const STAGE_HINT_CLARIFY = `
-## Stage 1 — Clarify
-Produce a clean, legible brief. One goal line, then 3-5 numbered
-requirements. The output should be a short, dense version of the
-user's intent — readable in 30 seconds.`;
-const STAGE_HINT_DETAIL = `
-## Stage 2 — Detail
-Take the brief above and break each requirement into a concrete
-sub-task. For each numbered item, add:
-- the tool or action the agent should use
-- the context or inputs it needs
-- the deliverable (file, response, or state change)
-
-Result is an executable task list an agent can follow step by step.`;
-const STAGE_HINT_HORIZON = `
-## Stage 3 — Horizon
-Reframe the task as a long-running project. Add:
-- Phases or milestones (numbered, with checkpoints)
-- Dependencies between phases
-- Success criteria per phase (how the agent knows it's done)
-- A time-horizon framing ("end of day", "weekly", "milestone-based")
-
-The result is a phased plan, not a one-shot request. The agent
-should be able to resume from any checkpoint.`;
-
-/* ─── enhanceOnce ──────────────────────────────────────────────────────── */
-async function enhanceOnce(input, signal, maxChars, stage) {
-  const stageHint =
-    stage === 2
-      ? STAGE_HINT_DETAIL
-      : stage === 3
-      ? STAGE_HINT_HORIZON
-      : STAGE_HINT_CLARIFY;
-  const capHint = maxChars
-    ? `\n\nIMPORTANT: Produce a detailed rewrite of ${maxChars * 2}–${maxChars * 3} characters.`
-    : "";
-  const created = await rpc("session.create", {
-    title: "Enhance prompt",
-    hidden: true,
-    messages: [
-      { role: "system", content: SYSTEM },
-      { role: "system", content: stageHint },
-    ],
-  });
-  const sid = created.session_id;
-  if (!sid) throw new Error("session.create returned no session_id");
-
-  const user = USER_WRAP.replace("{input}", input) + capHint;
-  await rpc("prompt.submit", { session_id: sid, text: user });
-
-  const start = Date.now();
-  let last = "";
-  let stable = 0;
-  let pollMs = INIT_POLL_MS;
-
-  while (Date.now() - start < TIMEOUT_MS) {
-    if (signal?.aborted) throw new DOMException("aborted", "AbortError");
-    try {
-      const hist = await rpc("session.history", { session_id: sid });
-      const next = stripQuotes(
-        lastAssistant(hist.messages || hist.history || [])
-      );
-      if (next && next === last) {
-        stable += 1;
-        if (stable >= 2) return next;
-      } else if (next) {
-        last = next;
-        stable = 0;
-      }
-    } catch {
-      /* keep polling */
-    }
-    await sleep(pollMs, signal);
-    pollMs = Math.min(pollMs * 1.5, MAX_POLL_MS);
-  }
-  if (last) return last;
-  throw new Error("timed out waiting for enhanced prompt");
-}
-
 /* ─── EnhancementButton ──────────────────────────────────────────────────── */
 
-function EnhanceButton() {
+function EnhanceButton({ request }) {
   const chatBusy = useValue(host.state.busy);
   const [enhancing, setEnhancing] = useState(false);
   const [hasBackup, setHasBackup] = useState(false);
@@ -409,6 +195,7 @@ function EnhanceButton() {
   const backup = useRef(null);
   const after = useRef(null);
   const abort = useRef(null);
+  const scoreAbort = useRef(null);
   // 0 = no enhance yet, 1 = first pass done (2000 char cap), 2 = first extend
   // done (4000 char cap), 3 = second extend (still 4000 cap; further stages
   // are useful mainly for re-applying different framing). Tracked so that
@@ -452,9 +239,47 @@ function EnhanceButton() {
 
   const cancel = useCallback(() => {
     abort.current?.abort();
+    scoreAbort.current?.abort();
     abort.current = null;
+    scoreAbort.current = null;
     setEnhancing(false);
   }, []);
+
+  const scheduleScore = useCallback(
+    (beforeText, afterText) => {
+      scoreAbort.current?.abort();
+      const ac = new AbortController();
+      scoreAbort.current = ac;
+      void (async () => {
+        try {
+          const [before, afterScore] = await Promise.all([
+            geValScore(request, "ORIGINAL", beforeText, ac.signal),
+            geValScore(request, "REWRITE", afterText, ac.signal),
+          ]);
+          if (ac.signal.aborted) return;
+          if (before || afterScore) {
+            lastScore.current = { before, after: afterScore };
+            forceRender();
+          } else {
+            host.notify({
+              kind: "info",
+              message: "Scorer unavailable — enhancement is live, no score.",
+            });
+          }
+        } catch (err) {
+          if (err?.name !== "AbortError") {
+            host.notify({
+              kind: "info",
+              message: "Scorer unavailable — enhancement is live, no score.",
+            });
+          }
+        } finally {
+          if (scoreAbort.current === ac) scoreAbort.current = null;
+        }
+      })();
+    },
+    [forceRender, request]
+  );
 
   // stageRun advances the enhance to the next stage and appends the result.
   // stage 0 → 1: first pass
@@ -478,7 +303,7 @@ function EnhanceButton() {
     const current = readDraft();
     try {
       const enhanced = stripQuotes(
-        await enhanceOnce(current, ac.signal, cap, nextStage)
+        await enhanceOnce(current, ac.signal, cap, nextStage, request)
       );
       if (ac.signal.aborted) return;
       if (!enhanced) throw new Error("empty rewrite");
@@ -507,18 +332,7 @@ function EnhanceButton() {
         setHasBackup(true);
         stage.current = nextStage;
       });
-
-      try {
-        const score = await geValScore(host, "REWRITE", readDraft());
-        if (ac.signal.aborted) return;
-        if (score) {
-          lastScore.current = {
-            before: lastScore.current ? lastScore.current.before : null,
-            after: score,
-          };
-          forceRender();
-        }
-      } catch { /* scoring is best-effort */ }
+      scheduleScore(current, merged);
     } catch (err) {
       if (err?.name === "AbortError") return;
       const msg = err instanceof Error ? err.message : String(err);
@@ -528,12 +342,14 @@ function EnhanceButton() {
       if (abort.current === ac) abort.current = null;
       setEnhancing(false);
     }
-  }, [cancel, forceRender]);
+  }, [cancel, request, scheduleScore]);
 
   // revert restores the original text before any enhance ran.
   const revert = useCallback(() => {
     const text = backup.current;
     if (!text) return;
+    scoreAbort.current?.abort();
+    scoreAbort.current = null;
     backup.current = null;
     after.current = null;
     setHasBackup(false);
@@ -573,7 +389,7 @@ function EnhanceButton() {
       // Soft cap hint for max_tokens; no hard cap on displayed output.
       const cap = stage.current || 2;
       const extended = stripQuotes(
-        await enhanceOnce(current, ac.signal, cap * 3000, cap)
+        await enhanceOnce(current, ac.signal, cap * 3000, cap, request)
       );
       if (ac.signal.aborted) return;
       if (!extended) throw new Error("empty extension");
@@ -591,21 +407,7 @@ function EnhanceButton() {
         setHasBackup(true);
         stage.current = cap;
       });
-
-      // Re-score the merged result so the badge stays accurate.
-      try {
-        const score = await geValScore(host, "REWRITE", readDraft());
-        if (ac.signal.aborted) return;
-        if (score) {
-          lastScore.current = {
-            before: lastScore.current ? lastScore.current.before : null,
-            after: score,
-          };
-          forceRender();
-        }
-      } catch {
-        /* scoring is best-effort */
-      }
+      scheduleScore(current, merged);
     } catch (err) {
       if (err?.name === "AbortError") return;
       const msg = err instanceof Error ? err.message : String(err);
@@ -615,7 +417,7 @@ function EnhanceButton() {
       if (abort.current === ac) abort.current = null;
       setEnhancing(false);
     }
-  }, [hasBackup, cancel, forceRender]);
+  }, [hasBackup, cancel, request, scheduleScore]);
 
   const run = useCallback(async () => {
     const text = readDraft();
@@ -638,7 +440,7 @@ function EnhanceButton() {
       // Soft hint for max_tokens; no hard cap on displayed output.
       const cap = 3000; // stage 1: clarify
       const enhanced = stripQuotes(
-        await enhanceOnce(text, ac.signal, cap, 1)
+        await enhanceOnce(text, ac.signal, cap, 1, request)
       );
       if (ac.signal.aborted) return;
       if (!enhanced) throw new Error("empty rewrite");
@@ -675,35 +477,7 @@ function EnhanceButton() {
         stage.current = 1; // first stage (clarify) complete
       });
 
-      // Score before and after via G-EVAL. Show progress while scoring.
-      try {
-        const beforeScore = await geValScore(host, "ORIGINAL", backup.current || text);
-        if (ac.signal.aborted) return;
-        if (beforeScore) {
-          lastScore.current = { before: beforeScore, after: null };
-          forceRender();
-        }
-        const afterScore = await geValScore(host, "REWRITE", clipped);
-        if (ac.signal.aborted) return;
-        if (afterScore) {
-          lastScore.current = {
-            before: lastScore.current ? lastScore.current.before : beforeScore,
-            after: afterScore,
-          };
-          forceRender();
-        }
-        if (!beforeScore && !afterScore) {
-          host.notify({
-            kind: "info",
-            message: "Scorer timed out — enhancement is live, no score.",
-          });
-        }
-      } catch (scoreErr) {
-        host.notify({
-          kind: "info",
-          message: "Scorer unavailable — enhancement is live, no score.",
-        });
-      }
+      scheduleScore(text, enhanced);
     } catch (err) {
       if (err?.name === "AbortError") return;
       const msg = err instanceof Error ? err.message : String(err);
@@ -716,7 +490,7 @@ function EnhanceButton() {
       if (abort.current === ac) abort.current = null;
       setEnhancing(false);
     }
-  }, [cancel]);
+  }, [cancel, request, scheduleScore]);
 
   const disabled = enhancing ? false : !!chatBusy || !hasText;
   const ls = lastScore.current;
@@ -730,7 +504,7 @@ function EnhanceButton() {
         return "Stage 3: convert to phased plan";
       return "Advance to next stage";
     }
-    return "Enhance prompt (general — 2000 chars)";
+    return "Enhance prompt (direct rewrite)";
   })();
   const scoreTip = (() => {
     if (!ls || !ls.after) return null;
@@ -845,7 +619,7 @@ function EnhanceButton() {
 
 function clickSparkle() {
   const tips = [
-    "Enhance prompt (general — 2000 chars)",
+    "Enhance prompt (direct rewrite)",
     "Advance enhance to next stage",
     "Enhancing… click to cancel",
   ];
@@ -877,7 +651,10 @@ export default {
       id: "star",
       area: COMPOSER_AREAS.actions,
       order: 40,
-      render: () => jsx(EnhanceButton, {}),
+      render: () =>
+        jsx(EnhanceButton, {
+          request: (path, options) => ctx.rest(path, options),
+        }),
     });
 
     ctx.register({

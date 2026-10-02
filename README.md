@@ -10,7 +10,7 @@ Sparkle beside Send on [Hermes Desktop](https://hermes-agent.nousresearch.com). 
 - Click while spinning to cancel the wait
 - Ctrl/Cmd+K → **Enhance prompt**
 
-Uses your **current Desktop model** via a hidden Hermes session. Same language as the original. Does not invent tech you did not name. Does not answer the question — it expands it.
+Uses the active Hermes model/auth through a direct, tool-free completion. The rewrite cannot create a Hermes session, invoke skills, or call tools such as `prompt-master`. It does not answer the request — it reformulates it.
 
 ## Demo
 
@@ -75,13 +75,13 @@ The Desktop watches that folder. Drop the file in; no `npm run pack`.
 ### How the sparkle works
 
 1. Reads the composer (`data-slot="composer-rich-input"`)
-2. Hidden `session.create` + rewrite system prompt (uses the **active** model)
-3. `prompt.submit` the draft
-4. Polls `session.history` until the assistant text settles
-5. **Selects all** then `insertText` so the draft is replaced, not appended
-6. Shows `before→after` quality score inside the sparkle button
+2. Calls the plugin backend's direct, tool-free rewrite endpoint
+3. The backend runs one constrained completion and returns text
+4. **Selects all** then `insertText` so the draft is replaced, not appended
+5. Starts optional before/after scoring in the background
+6. Shows the `before→after` quality score beside the sparkle when scoring finishes
 
-Cancel is UI-only. The hidden session may still finish.
+Cancel is UI-only: it stops waiting and ignores the late response if the backend call is already in flight.
 
 ---
 
@@ -109,11 +109,12 @@ enhance_prompt(input="fix the login", max_chars=1200)
 
 ## Limits
 
-- Desktop sparkle needs a live Desktop gateway and a working model
-- One model turn per click
+- Desktop sparkle needs a live Desktop backend and a working model
+- Rewrite calls have a five-minute host timeout
+- Scoring is a separate best-effort direct completion and never blocks the rewrite
+- No prompt-master or other Hermes skill/tool can run during a rewrite or score
 - No public `setComposerDraft` SDK — write path is DOM-based (select-all + insertText)
 - Drafts under 8 characters are ignored
-- Quality score is a local heuristic (goal line, numbered steps, action verb, specifics) — not an LLM judge
 
 ## Installing-agent notes
 

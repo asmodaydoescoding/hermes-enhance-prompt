@@ -23,7 +23,7 @@ from typing import Any, Dict
 
 from .prompts import SYSTEM, build_user_message, strip_wrappers, MAX_CHARS
 
-__version__ = "0.2.0"
+__version__ = "0.4.1"
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "enhance_prompt"
@@ -74,12 +74,17 @@ def _enhance_text(ctx, input_text: str, max_chars: int) -> str:
         max_tok = 16384
     else:
         max_tok = min(16384, max(256, cap * 2))
-    raw = ctx.llm.complete(
-        system=SYSTEM,
-        messages=[{"role": "user", "content": user_msg}],
+    result = ctx.llm.complete(
+        messages=[
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": user_msg},
+        ],
         temperature=0.2,
         max_tokens=max_tok,
+        timeout=300,
+        purpose="prompt rewrite",
     )
+    raw = getattr(result, "text", result)
     text = strip_wrappers(raw or "").strip()
     if not text:
         raise RuntimeError("enhance_prompt: empty response from model")

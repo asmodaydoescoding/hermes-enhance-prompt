@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.1] — 2026-09-05
+
+### Fixed
+- Desktop rewrites now use the plugin backend's direct host LLM completion instead of creating a normal Hermes hidden session.
+- Rewrite calls have a five-minute timeout instead of the previous 90-second polling deadline.
+- Direct rewrite and scoring requests pass an empty tool list, so `prompt-master` and every other Hermes skill/tool are unavailable on this path.
+- The composer is updated and the spinner released before optional quality scoring completes.
+- Fixed the undefined `clipped` scorer variable.
+- Python agent-side calls now pass the actual `PluginLlmCompleteResult.text` value and use the host's five-minute timeout.
+- Python and desktop rewrite contracts now share their stage prompt definitions.
+- Updated the plugin manifest to declare its registered tool and command correctly.
+
+### Added
+- Hidden dashboard manifest and API routes for direct rewrite and scoring.
+
 ## [0.4.0] — 2026-09-05
 
 ### Added

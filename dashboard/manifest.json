@@ -1,0 +1,10 @@
+{
+  "name": "enhance-prompt",
+  "label": "Enhance Prompt",
+  "description": "Backend for the Enhance Prompt desktop composer action.",
+  "icon": "Sparkles",
+  "version": "0.4.1",
+  "tab": { "path": "/enhance-prompt", "position": "end", "hidden": true },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}
